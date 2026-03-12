@@ -5,7 +5,6 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::thread;
 
 #[derive(Parser)]
 #[command(name = "toss")]
@@ -40,23 +39,45 @@ struct Args {
 
 const SOCKET_PATH: &str = "/tmp/yeetyeetyeet";
 
+/// Information about a connection handled by the server.
+struct HandlingResult {
+    /// Whether any message in this connection requested persistent server mode.
+    stay_alive: bool,
+    /// Whether any operation (move/copy) was successful.
+    success: bool,
+}
+
 fn handle_connection(
     stream: UnixStream,
     destination_path: Arc<PathBuf>,
     quiet: bool,
     force_copy: bool,
-) -> io::Result<()> {
+) -> io::Result<HandlingResult> {
     let reader = BufReader::new(stream);
+    let mut stay_alive = false;
+    let mut success = false;
 
     for line in reader.lines() {
         match line {
             Ok(line) => {
-                let mut parts = line.splitn(2, '|');
+                if line.is_empty() {
+                    continue;
+                }
+                
+                let mut parts = line.splitn(3, '|');
+                let flags = parts.next().unwrap_or_default();
                 let action = parts.next().unwrap_or_default();
                 let source_path = parts.next().unwrap_or_default();
 
-                // Server's -c flag overrides: force everything to copy
-                let action = if force_copy { "copy" } else { action };
+                if flags.contains('S') {
+                    stay_alive = true;
+                }
+
+                let final_action = if force_copy || flags.contains('C') {
+                    "copy"
+                } else {
+                    action
+                };
 
                 let source = Path::new(source_path);
                 let destination = destination_path.join(
@@ -65,11 +86,13 @@ fn handle_connection(
                         .unwrap_or_else(|| std::ffi::OsStr::new("unknown")),
                 );
 
-                let (command, args) = match action {
+                let (command, args) = match final_action {
                     "copy" => ("cp", vec!["-r", source_path]),
                     "move" => ("mv", vec![source_path]),
                     _ => {
-                        eprintln!("Invalid action: {}", action);
+                        if !action.is_empty() {
+                            eprintln!("Invalid action: {}", action);
+                        }
                         continue;
                     }
                 };
@@ -79,19 +102,24 @@ fn handle_connection(
                 match output {
                     Ok(output) => {
                         if !output.status.success() {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
                             eprintln!(
                                 "Failed to {} {}: {}",
                                 command,
                                 source_path,
-                                String::from_utf8_lossy(&output.stderr)
+                                stderr
                             );
-                        } else if !quiet {
-                            println!(
-                                "{} '{}' -> '{}'",
-                                if command == "cp" { "Copied" } else { "Moved" },
-                                source_path,
-                                destination.display()
-                            );
+                        } else {
+                            success = true;
+                            if !quiet {
+                                println!(
+                                    "{} '{}' -> '{}'",
+                                    if final_action == "copy" { "Copied" } else { "Moved" },
+                                    source_path,
+                                    destination.display()
+                                );
+                                let _ = io::stdout().flush();
+                            }
                         }
                     }
                     Err(e) => {
@@ -106,7 +134,7 @@ fn handle_connection(
         }
     }
 
-    Ok(())
+    Ok(HandlingResult { stay_alive, success })
 }
 
 fn run_server(args: &Args) -> io::Result<()> {
@@ -121,136 +149,114 @@ fn run_server(args: &Args) -> io::Result<()> {
         std::env::current_dir()?
     };
 
-    // Clean up any stale socket file from a previous run
-    if Path::new(SOCKET_PATH).exists() {
-        std::fs::remove_file(SOCKET_PATH)?;
-    }
-
+    let _ = std::fs::remove_file(SOCKET_PATH);
     let listener = UnixListener::bind(SOCKET_PATH)?;
+    
+    let mut persistent = args.server;
+    
+    let op_mode = if args.copy { "copy mode" } else { "move mode" };
+    
     if !args.quiet {
-        println!("Waiting...");
+        if persistent {
+            println!("Waiting (continuous mode, {})...", op_mode);
+        } else {
+            println!("Waiting (one-time mode, {})...", op_mode);
+        }
+        let _ = io::stdout().flush();
     }
 
     let destination_path = Arc::new(destination_path);
 
-    let result = if args.server {
-        run_server_loop(&listener, &destination_path, args.quiet, args.copy)
-    } else {
-        run_server_once(&listener, &destination_path, args.quiet, args.copy)
-    };
-
-    // Clean up socket on exit
-    let _ = std::fs::remove_file(SOCKET_PATH);
-
-    result
-}
-
-fn run_server_loop(
-    listener: &UnixListener,
-    destination_path: &Arc<PathBuf>,
-    quiet: bool,
-    force_copy: bool,
-) -> io::Result<()> {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let destination_path = Arc::clone(destination_path);
-                thread::spawn(move || {
-                    if let Err(e) =
-                        handle_connection(stream, destination_path, quiet, force_copy)
-                    {
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let dest = Arc::clone(&destination_path);
+                let q = args.quiet;
+                let c = args.copy;
+                
+                match handle_connection(stream, dest, q, c) {
+                    Ok(result) => {
+                        if result.stay_alive && !persistent {
+                            persistent = true;
+                            if !args.quiet {
+                                println!("Switched to continuous mode.");
+                                println!("Waiting (continuous mode, {})...", op_mode);
+                                let _ = io::stdout().flush();
+                            }
+                        }
+                        
+                        // Exit one-time mode only if at least one operation succeeded
+                        if !persistent && result.success {
+                            break;
+                        }
+                    }
+                    Err(e) => {
                         eprintln!("Error handling connection: {}", e);
                     }
-                });
+                }
             }
             Err(e) => {
                 eprintln!("Failed to accept connection: {}", e);
+                break;
             }
         }
     }
-    Ok(())
-}
 
-fn run_server_once(
-    listener: &UnixListener,
-    destination_path: &Arc<PathBuf>,
-    quiet: bool,
-    force_copy: bool,
-) -> io::Result<()> {
-    match listener.accept() {
-        Ok((stream, _)) => {
-            let destination_path = Arc::clone(destination_path);
-            let handle = thread::spawn(move || {
-                handle_connection(stream, destination_path, quiet, force_copy).unwrap_or_else(
-                    |e| {
-                        eprintln!("Error handling connection: {}", e);
-                    },
-                );
-            });
-
-            handle.join().expect("Thread panicked");
-        }
-        Err(e) => {
-            eprintln!("Failed to accept connection: {}", e);
-        }
-    }
+    let _ = std::fs::remove_file(SOCKET_PATH);
     Ok(())
 }
 
 fn run_client(args: &Args) -> io::Result<()> {
-    match UnixStream::connect(SOCKET_PATH) {
-        Ok(mut stream) => {
-            for filename in &args.files {
-                match fs::canonicalize(filename) {
-                    Ok(absolute_path) => {
-                        let action = if args.copy { "copy" } else { "move" };
-                        let message = format!("{}|{}\n", action, absolute_path.to_string_lossy());
+    let mut stream = UnixStream::connect(SOCKET_PATH)?;
+    
+    for filename in &args.files {
+        match fs::canonicalize(filename) {
+            Ok(absolute_path) => {
+                let action = if args.copy { "copy" } else { "move" };
+                let mut flags = String::new();
+                if args.server { flags.push('S'); }
+                if args.copy { flags.push('C'); }
 
-                        stream.write_all(message.as_bytes())?;
-                        if !args.quiet {
-                            println!("Sent: {} ({})", absolute_path.display(), action);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Error: Could not resolve '{}': {}", filename, e);
-                    }
+                let message = format!(
+                    "{}|{}|{}\n",
+                    flags,
+                    action,
+                    absolute_path.to_string_lossy()
+                );
+
+                stream.write_all(message.as_bytes())?;
+                if !args.quiet {
+                    println!("Sent: {}", absolute_path.display());
+                    let _ = io::stdout().flush();
                 }
             }
-        }
-        Err(_) => {
-            eprintln!(
-                "Error: Could not connect to the server. Make sure toss is running as a server first."
-            );
+            Err(e) => {
+                eprintln!("Error: Could not resolve '{}': {}", filename, e);
+            }
         }
     }
-
+    
+    let _ = stream.flush();
     Ok(())
-}
-
-/// Check if a server is actually listening on the socket (not just a stale file).
-fn server_is_running() -> bool {
-    UnixStream::connect(SOCKET_PATH).is_ok()
 }
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
 
     if args.files.is_empty() {
-        if server_is_running() {
+        if UnixStream::connect(SOCKET_PATH).is_ok() {
             eprintln!("Error: A toss server is already running. Provide files to toss, or stop the existing server.");
             std::process::exit(1);
         }
-        // No live server, no files → start server
-        run_server(&args)?;
-    } else if server_is_running() {
-        // Live server and files provided → send files
-        run_client(&args)?;
+        run_server(&args)
     } else {
-        // No live server but files provided → start server, ignoring files
-        eprintln!("No toss server is running. Starting server in the current directory...");
-        eprintln!("(Files argument ignored. Run toss with files from another terminal after the server starts.)");
-        run_server(&args)?;
+        match run_client(&args) {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                eprintln!("No toss server is running. Starting server in the current directory...");
+                eprintln!("(Files argument ignored. Run toss with files from another terminal after the server starts.)");
+                run_server(&args)
+            }
+        }
     }
-
-    Ok(())
 }
