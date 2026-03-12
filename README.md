@@ -10,17 +10,15 @@ What I thought is.. why not just run a catcher in a destination path, and throw 
 
 ## Usage
 
-First run `catch` in the destination directory, then run `throw <path>`
-> Run `--help` for both programs for arguments and options.
+Run `toss` in the destination directory to start receiving, then run `toss <files>` from anywhere to send files.
+> Run `toss --help` for all arguments and options.
 
 ```sh
-# catch:
-catch
-```
+# Start the server (in destination directory):
+toss
 
-```sh
-# throw
-throw <path>
+# Send files (from another terminal):
+toss <files>
 ```
 
 # Installation
